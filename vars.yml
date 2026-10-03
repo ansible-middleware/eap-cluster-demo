@@ -2,6 +2,8 @@
 # Shared variables for the eap-cluster-demo playbooks.
 
 eap_version: "8.0.0"
+eap_install_workdir: /opt/jboss_eap/
+eap_home: "{{ eap_install_workdir }}jboss-eap-{{ (eap_version.split('.'))[0:2] | join('.') }}/"
 eap_config_base: standalone-full-ha.xml
 eap_offline_install: false
 eap_systemd_enable: true
