@@ -1,0 +1,6 @@
+---
+# Rollback-specific variables (loaded after vars.yml).
+# Overrides eap_version to target the EAP 8.1 installation created by upgrade.yml.
+# eap_home is computed from eap_version in vars.yml.
+
+eap_version: "8.1.0"

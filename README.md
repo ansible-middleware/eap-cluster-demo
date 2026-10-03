@@ -1,10 +1,10 @@
 # eap-cluster-demo
 
-A demo to set up a JBoss EAP 8.0 cluster (with an optional upgrade to 8.1) using the Ansible `redhat.eap` collection.
+A demo to set up a JBoss EAP 8.0 cluster (with an optional upgrade to 8.1 and server update rollback) using the Ansible `redhat.eap` collection.
 
 ## Overview
 
-This demo provisions a multi-node JBoss EAP 8.0 cluster using TCP PING for JGroups discovery. [`upgrade.yml`](upgrade.yml) can migrate the cluster to EAP 8.1 and apply the latest 8.1.x update. It uses the following `redhat.eap` collection roles:
+This demo provisions a multi-node JBoss EAP 8.0 cluster using TCP PING for JGroups discovery. [`upgrade.yml`](upgrade.yml) can migrate the cluster to EAP 8.1 and apply the latest 8.1.x update. [`rollback.yml`](rollback.yml) demonstrates the Prospero-based server update rollback mechanism. It uses the following `redhat.eap` collection roles:
 
 - **`eap_install`** – installs EAP 8.0.0 via JBoss Installation Manager (Prospero)
 - **`eap_systemd`** – configures the systemd service and applies YAML configuration
@@ -23,6 +23,8 @@ Shared variables are in [`vars.yml`](vars.yml). See [Repository layout](#reposit
 | [`validate.yml`](validate.yml) | Validate only (imported by `playbook.yml` after install) |
 | [`vars.yml`](vars.yml) | Shared playbook variables |
 | [`upgrade-vars.yml`](upgrade-vars.yml) | Upgrade-only overrides (`8.0.0` → `8.1.0`) |
+| [`rollback.yml`](rollback.yml) | Demonstrate Prospero server update rollback |
+| [`rollback-vars.yml`](rollback-vars.yml) | Rollback-only overrides (targets the 8.1 installation) |
 | [`inventory`](inventory) | Cluster inventory template |
 | [`tasks/cluster_nodes.yml`](tasks/cluster_nodes.yml) | Shared JGroups TCP PING cluster node list |
 | [`tasks/eap_version.yml`](tasks/eap_version.yml) | Shared EAP version reporting from `server.log` |
@@ -34,7 +36,7 @@ Shared variables are in [`vars.yml`](vars.yml). See [Repository layout](#reposit
 ## Requirements
 
 - **ansible-core** >= 2.16.0
-- **`redhat.eap`** collection >= 1.5.11 from [Red Hat Ansible Automation Hub](https://console.redhat.com/ansible/automation-hub)
+- **`redhat.eap`** collection >= 1.6.0 from [Red Hat Ansible Automation Hub](https://console.redhat.com/ansible/automation-hub)
 - A valid **Red Hat subscription** to download EAP online, or set `eap_offline_install: true` in [`vars.yml`](vars.yml) for offline installs
 - For **online installs** (`eap_offline_install: false`, the default), pass Red Hat Customer Portal credentials to the playbook as `rhn_username` and `rhn_password` (see [Online install credentials](#online-install-credentials))
 
@@ -111,6 +113,11 @@ ansible-playbook -i inventory validate.yml
 ansible-playbook -i inventory upgrade.yml \
   -e rhn_username='<client_id>' \
   -e rhn_password='<client_secret>'
+
+# Rollback: revert the last Prospero update on the 8.1 installation
+ansible-playbook -i inventory rollback.yml \
+  -e rhn_username='<client_id>' \
+  -e rhn_password='<client_secret>'
 ```
 
 ### Version reporting
@@ -145,6 +152,17 @@ Upgrading from 8.0 to 8.1 is a **major version migration**, not a Prospero in-pl
 5. Applies available 8.1.x updates (`eap_prospero_update: true`)
 
 Do not set `eap_version` to a patch level such as `8.1.7`; that artifact is not published separately in Red Hat Customer Portal. If your AAP job template passes `eap_version` as an extra variable, remove it or set it to `8.1.0` so it does not override `upgrade-vars.yml`.
+
+### Rollback behavior
+
+The rollback playbook ([`rollback.yml`](rollback.yml)) demonstrates the Prospero-based server update rollback mechanism introduced in `redhat.eap` >= 1.6.0. It operates on the EAP 8.1 installation and performs these steps:
+
+1. **Shows current state** — displays the running EAP version and Prospero revision history
+2. **Applies an update** — if Prospero updates are available, applies them (creating a new revision). If no updates are available, makes a channel configuration change to demonstrate the revert capability
+3. **Rolls back** — reverts the server to the initial install revision using `eap_utils` `prospero/revert.yml`, which stops the service, runs `prospero revert perform`, fixes file ownership, and restarts
+4. **Validates** — confirms the service is running and the server state matches the pre-update revision
+
+The rollback uses Prospero's built-in revision history (`prospero history`) to identify the target revision and `prospero revert perform` to restore the server to that state. This is a safe, atomic operation that restores server binaries and configuration to the exact state of the target revision.
 
 ## Cluster configuration
 
