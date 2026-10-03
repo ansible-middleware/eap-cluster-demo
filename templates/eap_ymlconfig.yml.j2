@@ -15,8 +15,8 @@ wildfly-configuration:
       stack:
         tcp:
           transport:
-            TCP:
-              socket-binding: jgroups-tcp
+            type: TCP
+            socket-binding: jgroups-tcp
           protocol:
             MPING: !remove
           protocol:
