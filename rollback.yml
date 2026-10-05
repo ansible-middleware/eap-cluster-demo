@@ -1,0 +1,336 @@
+---
+- name: Fix AAP Localhost Sudo Issue
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Disable privilege escalation for localhost
+      ansible.builtin.add_host:
+        name: localhost
+        ansible_become: false
+        ansible_connection: local
+
+- name: "Step 0: Discover Prospero installation"
+  hosts: all:!localhost
+  become: true
+  collections:
+    - redhat.eap
+  vars_files:
+    - vars.yml
+    - rollback-vars.yml
+  tasks:
+    - name: Find Prospero installation directory
+      ansible.builtin.find:
+        paths: "{{ eap_utils_prospero_install_dir | default('/opt/prospero') }}"
+        patterns: "jboss-eap-installation-manager*"
+        file_type: directory
+      register: prospero_find_result
+
+    - name: Verify Prospero is installed
+      ansible.builtin.assert:
+        that:
+          - prospero_find_result.files | length > 0
+        fail_msg: "Prospero not found under {{ eap_utils_prospero_install_dir | default('/opt/prospero') }}. Run playbook.yml with eap_version=8.1.0 first."
+        quiet: true
+
+    - name: Set Prospero home path
+      ansible.builtin.set_fact:
+        eap_utils_prospero_home: "{{ (prospero_find_result.files | sort(attribute='mtime', reverse=True) | first).path }}"
+
+    - name: Confirm Prospero home
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Prospero home = {{ eap_utils_prospero_home }}"
+
+- name: "Step 1: Show current EAP server state"
+  hosts: all:!localhost
+  become: true
+  collections:
+    - redhat.eap
+  vars_files:
+    - vars.yml
+    - rollback-vars.yml
+  tasks:
+    - name: Report current EAP version
+      ansible.builtin.include_tasks: tasks/eap_version.yml
+      vars:
+        eap_version_message: currently running
+
+    - name: Retrieve Prospero revision history
+      ansible.builtin.include_role:
+        name: eap_utils
+        tasks_from: prospero/run_cli.yml
+      vars:
+        eap_utils_prospero_run_args: "history --dir {{ eap_home }}"
+
+    - name: Parse revision history
+      ansible.builtin.set_fact:
+        eap_utils_prospero_history: "{{ eap_utils_prospero_run_results.stdout }}"
+        eap_utils_prospero_revision_ids: "{{ eap_utils_prospero_run_results.stdout | regex_findall('\\[([a-f0-9]+)\\]') }}"
+
+    - name: Display current revision count
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ eap_utils_prospero_revision_ids | length }} revision(s) found.
+          Latest revision: {{ eap_utils_prospero_revision_ids[0] | default('none') }}
+
+- name: "Step 2: Apply Prospero update to create a rollback point"
+  hosts: all:!localhost
+  become: true
+  collections:
+    - redhat.eap
+  vars_files:
+    - vars.yml
+    - rollback-vars.yml
+  tasks:
+    - name: Check for available Prospero updates
+      ansible.builtin.include_role:
+        name: eap_utils
+        tasks_from: prospero/run_cli.yml
+      vars:
+        eap_utils_prospero_run_args: "update list --dir {{ eap_home }}"
+
+    - name: Determine if updates are available
+      ansible.builtin.set_fact:
+        prospero_updates_available: "{{ 'No updates found' not in eap_utils_prospero_run_results.stdout }}"
+
+    - name: Display update check result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Updates available = {{ prospero_updates_available }}"
+
+    - name: Get pre-update revision history
+      ansible.builtin.include_role:
+        name: eap_utils
+        tasks_from: prospero/run_cli.yml
+      vars:
+        eap_utils_prospero_run_args: "history --dir {{ eap_home }}"
+
+    - name: Save install revision ID for rollback
+      ansible.builtin.set_fact:
+        eap_utils_prospero_revision_ids: "{{ eap_utils_prospero_run_results.stdout | regex_findall('\\[([a-f0-9]+)\\]') }}"
+        rollback_target_revision: "{{ (eap_utils_prospero_run_results.stdout | regex_findall('\\[([a-f0-9]+)\\]'))[-1] }}"
+        pre_update_revision_count: "{{ (eap_utils_prospero_run_results.stdout | regex_findall('\\[([a-f0-9]+)\\]')) | length }}"
+
+    - name: Display rollback target
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: Rollback target will be revision
+          {{ rollback_target_revision }} (initial install)
+
+    - name: Apply available updates
+      when: prospero_updates_available | bool
+      block:
+        - name: Stop EAP before update
+          ansible.builtin.service:
+            name: "{{ eap_instance_name | default('eap') }}"
+            state: stopped
+
+        - name: Apply Prospero updates
+          ansible.builtin.include_role:
+            name: eap_utils
+            tasks_from: prospero/run_cli.yml
+          vars:
+            eap_utils_prospero_run_args: "update perform --dir {{ eap_home }} -y"
+
+        - name: Start EAP after update
+          ansible.builtin.service:
+            name: "{{ eap_instance_name | default('eap') }}"
+            state: started
+
+        - name: Wait for server to start after update
+          ansible.builtin.wait_for:
+            port: "{{ eap_http_port | default(8080) }}"
+            host: "{{ ansible_default_ipv4.address | default('127.0.0.1') }}"
+            delay: 5
+            timeout: 120
+
+        - name: Report updated EAP version
+          ansible.builtin.include_tasks: tasks/eap_version.yml
+          vars:
+            eap_version_message: updated to
+
+        - name: Get revision history after update
+          ansible.builtin.include_role:
+            name: eap_utils
+            tasks_from: prospero/run_cli.yml
+          vars:
+            eap_utils_prospero_run_args: "history --dir {{ eap_home }}"
+
+        - name: Confirm update created a new revision
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: Revision count went from
+              {{ pre_update_revision_count }} to
+              {{ (eap_utils_prospero_run_results.stdout | regex_findall('\[([a-f0-9]+)\]')) | length }}.
+              Update applied successfully.
+
+    - name: Skip update notice
+      when: not (prospero_updates_available | bool)
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: No Prospero updates available.
+          Rollback will demonstrate reverting a channel configuration change instead.
+
+    - name: Create a configuration change for rollback demo (when no updates available)
+      when: not (prospero_updates_available | bool)
+      block:
+        - name: Capture pre-change channel configuration
+          ansible.builtin.include_role:
+            name: eap_utils
+            tasks_from: prospero/run_cli.yml
+          vars:
+            eap_utils_prospero_run_args: "channel list --dir {{ eap_home }}"
+
+        - name: Store pre-change channel list
+          ansible.builtin.set_fact:
+            prospero_channels_before: "{{ eap_utils_prospero_run_results.stdout }}"
+
+        - name: Create a test channel manifest
+          ansible.builtin.copy:
+            content: |
+              schemaVersion: "1.0.0"
+            dest: /tmp/test-channel-manifest.yaml
+            mode: '0644'
+
+        - name: Add test channel to create a new revision
+          ansible.builtin.include_role:
+            name: eap_utils
+            tasks_from: prospero/run_cli.yml
+          vars:
+            eap_utils_prospero_run_args: >-
+              channel add --channel-name test-channel
+              --manifest /tmp/test-channel-manifest.yaml
+              --repositories https://repo1.maven.org/maven2/
+              --dir {{ eap_home }}
+
+        - name: Verify test channel was added
+          ansible.builtin.include_role:
+            name: eap_utils
+            tasks_from: prospero/run_cli.yml
+          vars:
+            eap_utils_prospero_run_args: "channel list --dir {{ eap_home }}"
+
+        - name: Confirm channel change
+          ansible.builtin.assert:
+            that:
+              - "'test-channel' in eap_utils_prospero_run_results.stdout"
+            fail_msg: "test-channel should appear in channel list"
+            quiet: true
+
+        - name: Get revision history after channel change
+          ansible.builtin.include_role:
+            name: eap_utils
+            tasks_from: prospero/run_cli.yml
+          vars:
+            eap_utils_prospero_run_args: "history --dir {{ eap_home }}"
+
+        - name: Display new revision from config change
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: Channel configuration change created new revision.
+              Total revisions: {{ (eap_utils_prospero_run_results.stdout | regex_findall('\[([a-f0-9]+)\]')) | length }}.
+
+- name: "Step 3: Rollback to previous revision"
+  hosts: all:!localhost
+  become: true
+  collections:
+    - redhat.eap
+  vars_files:
+    - vars.yml
+    - rollback-vars.yml
+  tasks:
+    - name: Get revision history before rollback
+      ansible.builtin.include_role:
+        name: eap_utils
+        tasks_from: prospero/run_cli.yml
+      vars:
+        eap_utils_prospero_run_args: "history --dir {{ eap_home }}"
+
+    - name: Display full revision history
+      ansible.builtin.debug:
+        msg: "{{ eap_utils_prospero_run_results.stdout }}"
+
+    - name: Identify rollback target (initial install revision)
+      ansible.builtin.set_fact:
+        rollback_target_revision: "{{ (eap_utils_prospero_run_results.stdout | regex_findall('\\[([a-f0-9]+)\\]'))[-1] }}"
+
+    - name: "Stop EAP service before rollback"
+      ansible.builtin.systemd:
+        name: "{{ eap_instance_name | default('eap') }}"
+        state: stopped
+
+    - name: "Perform rollback to revision {{ rollback_target_revision }}"
+      ansible.builtin.include_role:
+        name: eap_utils
+        tasks_from: prospero/run_cli.yml
+      vars:
+        eap_utils_prospero_run_args: "revert perform --dir {{ eap_home }} --revision {{ rollback_target_revision }} -y"
+
+    - name: Display rollback result
+      ansible.builtin.debug:
+        msg: "{{ eap_utils_prospero_run_results.stdout }}"
+
+    - name: Ensure server home ownership after rollback
+      ansible.builtin.file:
+        path: "{{ eap_home }}"
+        state: directory
+        owner: "{{ eap_user | default('eap') }}"
+        group: "{{ eap_group | default(eap_user | default('eap')) }}"
+        recurse: true
+
+    - name: Start EAP service after rollback
+      ansible.builtin.systemd:
+        name: "{{ eap_instance_name | default('eap') }}"
+        state: started
+
+- name: "Step 4: Validate server after rollback"
+  hosts: all:!localhost
+  become: true
+  collections:
+    - redhat.eap
+  vars_files:
+    - vars.yml
+    - rollback-vars.yml
+  tasks:
+    - name: Wait for EAP to be fully started after rollback
+      ansible.builtin.wait_for:
+        port: "{{ eap_http_port | default(8080) }}"
+        host: "{{ ansible_default_ipv4.address | default('127.0.0.1') }}"
+        delay: 5
+        timeout: 120
+
+    - name: Report EAP version after rollback
+      ansible.builtin.include_tasks: tasks/eap_version.yml
+      vars:
+        eap_version_message: rolled back to
+
+    - name: Get final revision history
+      ansible.builtin.include_role:
+        name: eap_utils
+        tasks_from: prospero/run_cli.yml
+      vars:
+        eap_utils_prospero_run_args: "history --dir {{ eap_home }}"
+
+    - name: Display final revision history
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: Rollback complete.
+          {{ (eap_utils_prospero_run_results.stdout | regex_findall('\[([a-f0-9]+)\]')) | length }} revision(s) in history.
+
+    - name: Verify EAP service is active
+      ansible.builtin.systemd:
+        name: "{{ eap_instance_name | default('eap') }}"
+        state: started
+      register: eap_rollback_service_status
+      check_mode: true
+
+    - name: Assert service is running after rollback
+      ansible.builtin.assert:
+        that:
+          - not eap_rollback_service_status.changed
+        fail_msg: "EAP service should be running after rollback"
+        quiet: true
+
+    - name: Rollback summary
+      ansible.builtin.debug:
+        msg: >-
+          SUCCESS: {{ inventory_hostname }} has been rolled back to revision
+          {{ rollback_target_revision }}. EAP service is running and healthy.
